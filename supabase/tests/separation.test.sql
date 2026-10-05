@@ -1,6 +1,10 @@
 -- Separation test. Re-run after every database change: supabase test db
 begin;
 create extension if not exists pgtap with schema extensions;
+-- On hosted projects the CLI logs in as cli_login_postgres, which cannot see the
+-- extensions schema. Run as postgres instead, and return to it rather than reset role.
+set local role postgres;
+set local search_path = extensions, public;
 select plan(20);
 
 -- Two companies, each with a user, venue, device, holder, scan, allocation, close count.
@@ -44,7 +48,7 @@ select throws_ok($$insert into public.scans (venue_id, device_id, night_date, se
   '42501', null, 'anon cannot insert scans directly');
 select throws_ok($$select public.upload_scans('wrong-key', '[]')$$, '28000', null, 'unknown key refused');
 
-reset role;
+set local role postgres;
 select is((select count(*)::int from public.scans where code = 'AA-1'), 1, 'same scan sent twice leaves one row');
 select is((select venue_id from public.scans where code = 'AA-1'),
   'aaaaaaaa-0000-0000-0000-000000000003'::uuid, 'scan lands in the key''s venue, not the one sent');
@@ -72,7 +76,7 @@ select throws_ok($$insert into public.scans (venue_id, device_id, night_date, se
   values ('bbbbbbbb-0000-0000-0000-000000000003', 'bbbbbbbb-0000-0000-0000-000000000004', '2026-10-01', 1, 'x', 'ok', now())$$,
   '42501', null, 'people cannot insert scans directly');
 
-reset role;
+set local role postgres;
 select is((select name from public.venues where id = 'aaaaaaaa-0000-0000-0000-000000000003'), 'Venue A', 'B update to A venue had no effect');
 
 -- Revoked device is refused.
