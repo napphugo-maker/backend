@@ -4,3 +4,4 @@
 !.env.example
 supabase/.temp/
 supabase/.branches/
+*.csv
