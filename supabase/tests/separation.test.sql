@@ -5,7 +5,7 @@ create extension if not exists pgtap with schema extensions;
 -- extensions schema. Run as postgres instead, and return to it rather than reset role.
 set local role postgres;
 set local search_path = extensions, public;
-select plan(20);
+select plan(33);
 
 -- Two companies, each with a user, venue, device, holder, scan, allocation, close count.
 insert into auth.users (id, email) values
@@ -35,10 +35,10 @@ insert into public.close_counts (venue_id, night_date, cards_counted) values
 
 -- A's phone uploads one scan, twice. Also check its device/venue cannot be spoofed.
 set local role anon;
-select public.upload_scans('key-a', '[{"night_date":"2026-10-01","seq":1,"code":"AA-1","result":"ok",
-  "timestamp":"2026-10-01T23:00:00+08","venue_id":"bbbbbbbb-0000-0000-0000-000000000003"}]');
-select public.upload_scans('key-a', '[{"night_date":"2026-10-01","seq":1,"code":"AA-1","result":"ok",
-  "timestamp":"2026-10-01T23:00:00+08"}]');
+select public.upload_scans('key-a', '[{"device_id":"aaaaaaaa-0000-0000-0000-0000000000f1","night_date":"2026-10-01",
+  "seq":1,"code":"AA-1","result":"ok","timestamp":"2026-10-01T23:00:00+08","venue_id":"bbbbbbbb-0000-0000-0000-000000000003"}]');
+select public.upload_scans('key-a', '[{"device_id":"aaaaaaaa-0000-0000-0000-0000000000f1","night_date":"2026-10-01",
+  "seq":1,"code":"AA-1","result":"ok","timestamp":"2026-10-01T23:00:00+08"}]');
 
 -- Phones with no login can read nothing.
 select throws_ok('select count(*) from public.scans',        '42501', null, 'anon cannot read scans');
@@ -48,8 +48,58 @@ select throws_ok($$insert into public.scans (venue_id, device_id, night_date, se
   '42501', null, 'anon cannot insert scans directly');
 select throws_ok($$select public.upload_scans('wrong-key', '[]')$$, '28000', null, 'unknown key refused');
 
+-- Handover: the host desk (phone f1) uploads a satellite's rows (phone f2) whose seqs
+-- overlap its own. Both must land; sending the batch again changes nothing.
+select results_eq($$select source_device_id, max_seq from public.upload_scans('key-a', '[
+  {"device_id":"aaaaaaaa-0000-0000-0000-0000000000f2","night_date":"2026-10-01","seq":1,"code":"AA-2","result":"ok","timestamp":"2026-10-01T23:05:00+08"},
+  {"device_id":"aaaaaaaa-0000-0000-0000-0000000000f2","night_date":"2026-10-01","seq":2,"code":"AA-3","result":"ok","timestamp":"2026-10-01T23:06:00+08"},
+  {"device_id":"aaaaaaaa-0000-0000-0000-0000000000f2","night_date":"2026-10-01","seq":3,"code":"AA-3","result":"void","cancels_seq":2,"timestamp":"2026-10-01T23:07:00+08"},
+  {"device_id":"aaaaaaaa-0000-0000-0000-0000000000f1","night_date":"2026-10-01","seq":2,"code":"AA-4","result":"ok","timestamp":"2026-10-01T23:08:00+08"}]')
+  order by 1$$,
+  $$values ('aaaaaaaa-0000-0000-0000-0000000000f1'::uuid, 2), ('aaaaaaaa-0000-0000-0000-0000000000f2'::uuid, 3)$$,
+  'upload replies with the highest seq held per scanning phone');
+select public.upload_scans('key-a', '[
+  {"device_id":"aaaaaaaa-0000-0000-0000-0000000000f2","night_date":"2026-10-01","seq":1,"code":"AA-2","result":"ok","timestamp":"2026-10-01T23:05:00+08"},
+  {"device_id":"aaaaaaaa-0000-0000-0000-0000000000f1","night_date":"2026-10-01","seq":2,"code":"AA-4","result":"ok","timestamp":"2026-10-01T23:08:00+08"}]');
+select throws_ok($$select public.upload_scans('key-a', '[{"night_date":"2026-10-01","seq":9,"code":"AA-9","result":"ok","timestamp":"2026-10-01T23:09:00+08"}]')$$,
+  '22023', null, 'row without the scanner''s device_id refused');
+select throws_ok($$select public.upload_scans('key-a', '[{"device_id":"aaaaaaaa-0000-0000-0000-0000000000f2","night_date":"2026-10-01","seq":9,"code":"AA-9","result":"void","cancels_seq":8,"timestamp":"2026-10-01T23:09:00+08"}]')$$,
+  '23503', null, 'void for a scan the server lacks refused');
+
+-- Pairing: anon cannot make codes.
+select throws_ok($$select public.create_pairing_code('aaaaaaaa-0000-0000-0000-000000000003', 'Satellite')$$,
+  '42501', null, 'anon cannot create pairing codes');
+
 set local role postgres;
 select is((select count(*)::int from public.scans where code = 'AA-1'), 1, 'same scan sent twice leaves one row');
+select is((select count(*)::int from public.scans where venue_id = 'aaaaaaaa-0000-0000-0000-000000000003'), 5,
+  'handover rows with overlapping seqs all land, once');
+select is((select c.code from public.scans v join public.scans c on c.id = v.cancels_scan_id where v.result = 'void'),
+  'AA-3', 'void cancels the scanning phone''s row, not the uploader''s');
+
+-- Pairing, as the SQL editor does it. The phone uses the code once and gets a working key.
+select set_config('test.code', public.create_pairing_code('aaaaaaaa-0000-0000-0000-000000000003', 'Satellite'), true);
+set local role anon;
+select set_config('test.key', (select device_key from public.pair_device(lower(current_setting('test.code')),
+  'aaaaaaaa-0000-0000-0000-0000000000f2')), true);
+select lives_ok($$select public.upload_scans(current_setting('test.key'), '[]')$$, 'paired key works');
+select throws_ok($$select public.pair_device(current_setting('test.code'), 'aaaaaaaa-0000-0000-0000-0000000000f3')$$,
+  '28000', null, 'a pairing code works only once');
+select throws_ok($$select public.pair_device('NOTACODE', 'aaaaaaaa-0000-0000-0000-0000000000f3')$$,
+  '28000', null, 'unknown pairing code refused');
+set local role postgres;
+select set_config('test.code', public.create_pairing_code('aaaaaaaa-0000-0000-0000-000000000003', 'Satellite'), true);
+update public.pairing_codes set expires_at = now() - interval '1 minute' where used_at is null;
+set local role anon;
+select throws_ok($$select public.pair_device(current_setting('test.code'), 'aaaaaaaa-0000-0000-0000-0000000000f3')$$,
+  '28000', null, 'expired pairing code refused');
+set local role postgres;
+select set_config('test.code', public.create_pairing_code('aaaaaaaa-0000-0000-0000-000000000003', 'Satellite'), true);
+set local role anon;
+select public.pair_device(current_setting('test.code'), 'aaaaaaaa-0000-0000-0000-0000000000f2');
+select throws_ok($$select public.upload_scans(current_setting('test.key'), '[]')$$,
+  '28000', null, 're-pairing a phone revokes its old key');
+set local role postgres;
 select is((select venue_id from public.scans where code = 'AA-1'),
   'aaaaaaaa-0000-0000-0000-000000000003'::uuid, 'scan lands in the key''s venue, not the one sent');
 
@@ -66,6 +116,9 @@ select is((select count(*)::int from public.scans        where venue_id = 'aaaaa
 select is((select count(*)::int from public.allocations  where venue_id = 'aaaaaaaa-0000-0000-0000-000000000003'), 0, 'B cannot see A allocations');
 select is((select count(*)::int from public.close_counts where venue_id = 'aaaaaaaa-0000-0000-0000-000000000003'), 0, 'B cannot see A close counts');
 select is((select count(*)::int from public.venues), 1, 'B sees its own venue');
+select is((select count(*)::int from public.pairing_codes where venue_id = 'aaaaaaaa-0000-0000-0000-000000000003'), 0, 'B cannot see A pairing codes');
+select throws_ok($$select public.create_pairing_code('aaaaaaaa-0000-0000-0000-000000000003', 'Intruder')$$,
+  '42501', null, 'B cannot create pairing codes for A');
 
 select throws_ok($$insert into public.card_holders (venue_id, code, name)
   values ('aaaaaaaa-0000-0000-0000-000000000003', 'X99', 'Intruder')$$, '42501', null, 'B cannot add holders to A');
